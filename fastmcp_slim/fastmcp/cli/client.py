@@ -8,6 +8,7 @@ import sys
 import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import cyclopts
 import mcp_types
@@ -64,9 +65,10 @@ def resolve_server_spec(
     Exactly one of ``server_spec`` or ``command`` should be provided.
 
     Resolution order for ``server_spec``:
-    1. URLs (``http://``, ``https://``) — passed through as-is.
-       If ``--transport`` is ``sse``, the URL is rewritten to end with ``/sse``
-       so ``infer_transport`` picks the right transport.
+    1. URLs (``http://``, ``https://``) — passed through as-is unless an
+       explicit transport is selected. In that case, the selected transport
+       is constructed directly; SSE URLs are rewritten to end with ``/sse``
+       while preserving their query and fragment.
     2. Existing file paths, or strings ending in ``.py``/``.js``/``.json``.
     3. Anything else — name-based resolution via ``resolve_name``.
 
@@ -94,8 +96,15 @@ def resolve_server_spec(
 
     # 1. URL
     if spec.startswith(("http://", "https://")):
-        if transport == "sse" and not spec.rstrip("/").endswith("/sse"):
-            spec = spec.rstrip("/") + "/sse"
+        if transport == "sse":
+            parsed = urlsplit(spec)
+            path = parsed.path
+            if not path.rstrip("/").endswith("/sse"):
+                path = f"{path.rstrip('/')}/sse"
+            spec = urlunsplit(parsed._replace(path=path))
+            return SSETransport(spec)
+        if transport == "http":
+            return StreamableHttpTransport(spec)
         return spec
 
     # 2. File path (must be a file, not a directory)
@@ -317,10 +326,27 @@ def _build_client(
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_nullable(schema: dict[str, Any]) -> dict[str, Any]:
+    """Reduce an optional schema (``X | None``) to the schema for ``X``."""
+
+    if "anyOf" in schema:
+        non_null = [s for s in schema["anyOf"] if s.get("type") != "null"]
+        if len(non_null) == 1:
+            return non_null[0]
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        non_null_types = [t for t in schema_type if t != "null"]
+        if len(non_null_types) == 1:
+            return {**schema, "type": non_null_types[0]}
+
+    return schema
+
+
 def coerce_value(raw: str, schema: dict[str, Any]) -> Any:
     """Coerce a string CLI value according to a JSON-Schema type hint."""
 
-    schema_type = schema.get("type", "string")
+    schema_type = _unwrap_nullable(schema).get("type", "string")
 
     if schema_type == "integer":
         try:

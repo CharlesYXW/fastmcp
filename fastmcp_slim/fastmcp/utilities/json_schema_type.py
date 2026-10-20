@@ -5,7 +5,7 @@ for validation with Pydantic. It supports:
 
 - Basic types (string, number, integer, boolean, null)
 - Complex types (arrays, objects)
-- Format constraints (date-time, email, uri)
+- Format constraints (date-time, date, time, duration, uuid, email, uri)
 - Numeric constraints (minimum, maximum, multipleOf)
 - String constraints (minLength, maxLength, pattern)
 - Array constraints (minItems, maxItems, uniqueItems)
@@ -65,7 +65,7 @@ from collections.abc import Callable, Hashable, Mapping
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import MISSING, dataclass, field, make_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from typing import (
     Annotated,
@@ -77,6 +77,7 @@ from typing import (
     Union,
     cast,
 )
+from uuid import UUID
 
 from pydantic import (
     AnyUrl,
@@ -148,6 +149,10 @@ _UnsatisfiableType = Annotated[Any, BeforeValidator(_reject_all)]
 
 FORMAT_TYPES: dict[str, Any] = {
     "date-time": datetime,
+    "date": date,
+    "time": time,
+    "duration": timedelta,
+    "uuid": UUID,
     "email": EmailStr,
     "uri": AnyUrl,
     "json": Json,
@@ -605,9 +610,22 @@ def _create_array_type(
     schemas: Mapping[str, Any],
     resolving_refs: frozenset[str],
 ) -> type | Annotated[Any, ...]:
-    """Create list type with optional constraints."""
+    """Create list/tuple type with optional constraints."""
+    prefix_items = schema.get("prefixItems")
     items = schema.get("items", {})
-    if isinstance(items, list):
+    if isinstance(prefix_items, list) and schema.get("minItems") == len(
+        prefix_items
+    ) == schema.get("maxItems"):
+        # A positional schema (JSON Schema 2020-12) whose length is pinned to
+        # the number of positions is an exact tuple — this is the shape a
+        # fixed-length tuple annotation serializes to. Hydrate every position
+        # from its own schema so positional items keep their types instead of
+        # degrading to untyped objects.
+        positional_types = tuple(
+            _schema_to_type(s, schemas, resolving_refs) for s in prefix_items
+        )
+        base = tuple[positional_types]  # type: ignore[valid-type]  # ty:ignore[invalid-type-form]
+    elif isinstance(items, list):
         # Handle positional item schemas
         item_types = [_schema_to_type(s, schemas, resolving_refs) for s in items]
         combined = Union[tuple(item_types)]  # noqa: UP007
@@ -974,7 +992,22 @@ def _build_pydantic_model(
         # Handle defaults
         default_value = prop_schema.get("default", MISSING)
         if default_value is not MISSING:
-            field_definitions[prop_name] = (field_type, default_value)
+            # Check if the default value is valid against the field type.
+            # Only set validate_default=True when it passes, so that:
+            # 1. Valid defaults get hydrated (e.g., date strings → date objects)
+            # 2. Invalid defaults are preserved as-is rather than causing
+            #    validation errors that would be caught and logged during parsing
+            validate_default = False
+            try:
+                TypeAdapter(field_type).validate_python(default_value)
+                validate_default = True
+            except Exception:  # noqa: S110
+                # Default doesn't satisfy its own type; keep it as-is
+                pass
+            field_definitions[prop_name] = (
+                field_type,
+                Field(default=default_value, validate_default=validate_default),
+            )
         elif prop_name in required:
             field_definitions[prop_name] = (field_type, ...)
         else:

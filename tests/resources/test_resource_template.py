@@ -1,4 +1,6 @@
+import asyncio
 import functools
+import threading
 from typing import Annotated
 from urllib.parse import quote
 
@@ -7,7 +9,7 @@ from mcp.types import TextResourceContents
 from pydantic import BaseModel, Field
 
 from fastmcp import Client, Context, FastMCP
-from fastmcp.resources import ResourceTemplate
+from fastmcp.resources import ResourceContent, ResourceTemplate
 from fastmcp.resources.function_resource import FunctionResource
 from fastmcp.resources.template import (
     build_regex,
@@ -243,6 +245,25 @@ class TestResourceTemplate:
         result = await resource.read()
         assert result == b"test"
 
+    async def test_sync_template_runs_concurrently(self):
+        """Sync template functions run in the threadpool and don't block each other."""
+        num_calls = 3
+        barrier = threading.Barrier(num_calls, timeout=0.5)
+
+        def concurrent_template(id: str) -> str:
+            barrier.wait()
+            return id
+
+        template = ResourceTemplate.from_function(
+            fn=concurrent_template, uri_template="data://{id}"
+        )
+
+        # Raises BrokenBarrierError if the reads run one at a time on the loop
+        results = await asyncio.gather(
+            *(template.read(arguments={"id": str(i)}) for i in range(num_calls))
+        )
+        assert results == [str(i) for i in range(num_calls)]
+
     async def test_basemodel_conversion(self):
         """Test handling of BaseModel types."""
 
@@ -374,6 +395,35 @@ class TestResourceTemplate:
                 uri_template="test://{x}/{args*}",
                 name="test",
             )
+
+    async def test_function_with_positional_only_not_allowed(self):
+        def func(x: int, /) -> int:
+            return x
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Functions with positional-only parameters are not supported as "
+                "resource templates.*standard parameters"
+            ),
+        ):
+            ResourceTemplate.from_function(
+                fn=func,
+                uri_template="test://{x}",
+                name="test",
+            )
+
+    async def test_function_with_keyword_only_ok(self):
+        def func(x: int, *, y: int = 1) -> int:
+            return x + y
+
+        template = ResourceTemplate.from_function(
+            fn=func,
+            uri_template="test://{x}{?y}",
+            name="test",
+        )
+
+        assert await template.read({"x": "2", "y": "3"}) == 5
 
     async def test_function_with_varkwargs_ok(self):
         def func(x: int, **kwargs: int) -> int:
@@ -980,6 +1030,48 @@ class TestMalformedURITemplates:
         )
         assert result is not None
         assert result == {"id": "42", "format": ""}
+
+    def test_fragment_does_not_prevent_match(self):
+        result = match_uri_template(
+            "test://items/42#section",
+            "test://items/{id}",
+        )
+        assert result == {"id": "42"}
+
+    def test_query_fragment_is_not_part_of_param(self):
+        result = match_uri_template(
+            "test://items?filter=active#section",
+            "test://items{?filter}",
+        )
+        assert result == {"filter": "active"}
+
+    def test_fragment_after_path_param_and_query(self):
+        result = match_uri_template(
+            "test://items/42?format=json#section",
+            "test://items/{id}{?format}",
+        )
+        assert result == {"id": "42", "format": "json"}
+
+    def test_literal_fragment_in_template_still_matches(self):
+        result = match_uri_template(
+            "test://items/42#details",
+            "test://items/{id}#details",
+        )
+        assert result == {"id": "42"}
+
+    def test_literal_fragment_in_template_rejects_other_fragment(self):
+        result = match_uri_template(
+            "test://items/42#other",
+            "test://items/{id}#details",
+        )
+        assert result is None
+
+    def test_encoded_hash_stays_in_path_param(self):
+        result = match_uri_template(
+            "test://items/a%23b",
+            "test://items/{id}",
+        )
+        assert result == {"id": "a#b"}
 
     def test_query_param_with_blank_and_present_values(self):
         """Mix of blank and non-blank query values are both surfaced."""
@@ -1679,3 +1771,23 @@ class TestNonExplodedListQueryParams:
             [contents] = await client.read_resource(uri)
             assert isinstance(contents, TextResourceContents)
             assert contents.text == expected
+
+
+class TestTemplateComponentMetaPropagation:
+    """A template's component meta must reach list[ResourceContent] reads."""
+
+    async def test_list_resource_content_return_preserves_template_meta(self):
+        mcp = FastMCP()
+        component_meta = {"ui": {"csp": "default-src none"}, "team": "infra"}
+
+        @mcp.resource("data://multi/{id}", meta=component_meta)
+        def multi(id: str) -> list[ResourceContent]:
+            return [ResourceContent("a"), ResourceContent("b", meta={"own": 1})]
+
+        async with Client(mcp) as client:
+            result = await client.read_resource_mcp("data://multi/1")
+
+        assert [content.meta for content in result.contents] == [
+            component_meta,
+            {**component_meta, "own": 1},
+        ]
